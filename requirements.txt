@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-requests
 python-dotenv
-sympy
 groq
 pydantic
+sympy
+requests
+python-multipart

@@ -6,14 +6,12 @@ import os
 import json
 import datetime
 from fastapi.responses import StreamingResponse
-import sympy as sp
-from sympy import simplify
 
 # ---------------- LOAD ENV ----------------
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-app = FastAPI(title="My AI Backend (Persistent Memory)")
+app = FastAPI(title="My AI Backend (Persistent Memory + Vision)")
 
 # ---------------- MEMORY CONFIG ----------------
 MEMORY_FILE = "memory.json"
@@ -41,7 +39,6 @@ class ChatRequest(BaseModel):
 # ---------------- SUBJECT DETECTION ----------------
 def detect_subject(prompt: str) -> str:
     p = prompt.lower()
-
     if any(x in p for x in ["+", "-", "*", "/", "solve", "calculate"]):
         return "math"
     if any(x in p for x in ["velocity", "force", "acceleration", "newton"]):
@@ -54,7 +51,6 @@ def detect_subject(prompt: str) -> str:
         return "history"
     if any(x in p for x in ["python", "java", "code"]):
         return "coding"
-
     return "chat"
 
 # ---------------- SUBJECT PROMPTS ----------------
@@ -73,24 +69,15 @@ def subject_prompt(subject: str) -> str:
 # ---------------- MEMORY CONTEXT ----------------
 def get_context_messages(user_id: str):
     history = conversation_memory.get(user_id, [])
-    messages = []
+    return [{"role": m["role"], "content": m["content"]} for m in history[-10:]]
 
-    for m in history[-10:]:
-        messages.append({
-            "role": m["role"],
-            "content": m["content"]
-        })
-
-    return messages
-
-# ---------------- AI CALL (TEXT + IMAGE) ----------------
+# ---------------- AI CALL ----------------
 def call_ai(user_id: str, prompt: str, image: str | None = None) -> str:
     subject = detect_subject(prompt)
-    system_prompt = subject_prompt(subject)
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        *get_context_messages(user_id),
+        {"role": "system", "content": subject_prompt(subject)},
+        *get_context_messages(user_id)
     ]
 
     if image:
@@ -98,10 +85,7 @@ def call_ai(user_id: str, prompt: str, image: str | None = None) -> str:
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": image}
-                }
+                {"type": "image_url", "image_url": {"url": image}}
             ]
         })
     else:
@@ -114,27 +98,13 @@ def call_ai(user_id: str, prompt: str, image: str | None = None) -> str:
     )
 
     reply = completion.choices[0].message.content.strip()
+    reply = reply.replace("\\n", "\n").replace("**", "").replace("*", "")
 
-    # Clean formatting
-    reply = reply.replace("\\n", "\n")
-    reply = reply.replace("\r\n", "\n").replace("\r", "\n")
-    reply = reply.replace("**", "").replace("*", "")
-
-    lines = [line.strip() for line in reply.split("\n") if line.strip()]
-    reply = "\n".join(lines) if subject == "math" else " ".join(lines)
-
-    # ---------------- SAVE MEMORY ----------------
     conversation_memory.setdefault(user_id, [])
-
-    conversation_memory[user_id].append({
-        "role": "user",
-        "content": prompt
-    })
-
-    conversation_memory[user_id].append({
-        "role": "assistant",
-        "content": reply
-    })
+    conversation_memory[user_id].extend([
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": reply}
+    ])
 
     conversation_memory[user_id] = conversation_memory[user_id][-MAX_MEMORY_MESSAGES:]
     save_memory(conversation_memory)
@@ -144,28 +114,23 @@ def call_ai(user_id: str, prompt: str, image: str | None = None) -> str:
 # ---------------- ROUTER ----------------
 def router(user_id: str, prompt: str, image: str | None = None) -> str:
     p = prompt.lower()
-
     if p in ["reset", "clear memory"]:
         conversation_memory[user_id] = []
         save_memory(conversation_memory)
         return "Memory cleared."
-
     if "time" in p or "date" in p:
         return datetime.datetime.now().strftime("%d %B %Y, %H:%M:%S")
-
     return call_ai(user_id, prompt, image)
 
 # ---------------- ROUTES ----------------
 @app.get("/")
 def root():
-    return {"status": "AI backend running with persistent memory + vision + streaming"}
+    return {"status": "AI backend running"}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
-    reply = router(req.user_id, req.message, req.image)
-    return {"reply": reply}
+    return {"reply": router(req.user_id, req.message, req.image)}
 
-# ---------------- STREAMING ROUTE ----------------
 @app.post("/chat-stream")
 def chat_stream(req: ChatRequest):
     def stream():
@@ -178,17 +143,13 @@ def chat_stream(req: ChatRequest):
             ],
             stream=True
         )
-
         for chunk in completion:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
-
     return StreamingResponse(stream(), media_type="text/plain")
 
-# ---------------- RUN ----------------
-import os
-import uvicorn
-
+# ---------------- RUN (RENDER SAFE) ----------------
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("app:app", host="0.0.0.0", port=port)
