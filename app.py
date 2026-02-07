@@ -1,44 +1,130 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
 from groq import Groq
 from dotenv import load_dotenv
 import os
 import json
 import datetime
+import hashlib
 from fastapi.responses import StreamingResponse
+
+from jose import jwt, JWTError
+
 
 # ---------------- LOAD ENV ----------------
 load_dotenv()
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-app = FastAPI(title="My AI Backend (Persistent Memory + Vision)")
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY is missing.")
+
+client = Groq(api_key=GROQ_API_KEY)
+
+app = FastAPI(title="My AI Backend (Auth + Memory + Vision)")
+
+
+# ---------------- AUTH CONFIG ----------------
+
+SECRET_KEY = "CHATLLAMA_SECRET_2026"
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_DAYS = 7
+
+USERS_FILE = "users.json"
+
 
 # ---------------- MEMORY CONFIG ----------------
+
 MEMORY_FILE = "memory.json"
 MAX_MEMORY_MESSAGES = 500
 
-# ---------------- LOAD / SAVE MEMORY ----------------
-def load_memory():
-    if not os.path.exists(MEMORY_FILE):
+
+# ---------------- LOAD / SAVE ----------------
+
+def load_json(file):
+    if not os.path.exists(file):
         return {}
-    with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+    with open(file, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_memory(memory):
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(memory, f, indent=2)
 
-conversation_memory = load_memory()
+def save_json(file, data):
+    with open(file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-# ---------------- REQUEST MODEL ----------------
+
+users_db = load_json(USERS_FILE)
+conversation_memory = load_json(MEMORY_FILE)
+
+
+# ---------------- REQUEST MODELS ----------------
+
+class Register(BaseModel):
+    username: str
+    password: str
+
+
+class Login(BaseModel):
+    username: str
+    password: str
+
+
 class ChatRequest(BaseModel):
     message: str
-    user_id: str = "default_user"
-    image: str | None = None  # base64 image
+    image: str | None = None
+
+
+# ---------------- PASSWORD (FIXED) ----------------
+
+def hash_pass(p: str):
+    return hashlib.sha256(p.encode()).hexdigest()
+
+
+def verify_pass(p: str, h: str):
+    return hashlib.sha256(p.encode()).hexdigest() == h
+
+
+# ---------------- TOKEN ----------------
+
+def create_token(user):
+    data = {
+        "sub": user,
+        "exp": datetime.datetime.utcnow() +
+        datetime.timedelta(days=TOKEN_EXPIRE_DAYS)
+    }
+
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_user(token: str):
+
+    try:
+        data = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return data["sub"]
+
+    except JWTError:
+        return None
+
+
+def auth(authorization: str = Header("")):
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Login required")
+
+    token = authorization.replace("Bearer ", "")
+
+    user = get_user(token)
+
+    if not user:
+        raise HTTPException(401, "Invalid token")
+
+    return user
+
 
 # ---------------- SUBJECT DETECTION ----------------
+
 def detect_subject(prompt: str) -> str:
     p = prompt.lower()
+
     if any(x in p for x in ["+", "-", "*", "/", "solve", "calculate"]):
         return "math"
     if any(x in p for x in ["velocity", "force", "acceleration", "newton"]):
@@ -51,105 +137,197 @@ def detect_subject(prompt: str) -> str:
         return "history"
     if any(x in p for x in ["python", "java", "code"]):
         return "coding"
+
     return "chat"
 
+
 # ---------------- SUBJECT PROMPTS ----------------
+
 def subject_prompt(subject: str) -> str:
+
     prompts = {
-        "math": "You are a mathematics expert. Explain step by step.",
-        "physics": "You are a physics teacher.",
-        "chemistry": "You are a chemistry expert.",
-        "biology": "You are a biology teacher.",
-        "history": "You are a history expert.",
-        "coding": "You are a programming mentor.",
-        "chat": "You are a friendly, intelligent AI assistant."
+        "math": "Math helper",
+        "physics": "Physics helper",
+        "chemistry": "Chemistry helper",
+        "biology": "Biology helper",
+        "history": "History helper",
+        "coding": "Code helper",
+        "chat": "Assistant"
     }
+
     return prompts.get(subject, prompts["chat"])
 
-# ---------------- MEMORY CONTEXT ----------------
-def get_context_messages(user_id: str):
-    history = conversation_memory.get(user_id, [])
-    return [{"role": m["role"], "content": m["content"]} for m in history[-10:]]
 
-# ---------------- AI CALL ----------------
-def call_ai(user_id: str, prompt: str, image: str | None = None) -> str:
+# ---------------- MEMORY - KEEP 23 MESSAGES ----------------
+
+def get_context_messages(user_id: str):
+    
+    history = conversation_memory.get(user_id, [])
+    
+    # Keep last 23 messages (11-12 exchanges) - perfect balance for GROQ free tier
+    return [{"role": m["role"], "content": m["content"]}
+            for m in history[-23:]]
+
+
+def save_memory():
+    save_json(MEMORY_FILE, conversation_memory)
+
+
+# ---------------- AI ----------------
+
+def call_ai(user_id: str, prompt: str, image=None) -> str:
+
     subject = detect_subject(prompt)
+    system_prompt = subject_prompt(subject)
 
     messages = [
-        {"role": "system", "content": subject_prompt(subject)},
-        *get_context_messages(user_id)
+        {"role": "system", "content": system_prompt},
+        *get_context_messages(user_id),
+        {"role": "user", "content": prompt},
     ]
 
-    if image:
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image}}
-            ]
-        })
-    else:
-        messages.append({"role": "user", "content": prompt})
+    try:
 
-    completion = client.chat.completions.create(
-        model="llama-3.2-11b-vision-preview" if image else "llama-3.1-8b-instant",
-        messages=messages,
-        temperature=0.4
-    )
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.4
+        )
+
+    except Exception as e:
+        print("GROQ ERROR:", e)
+        print("ERROR TYPE:", type(e).__name__)
+        print("ERROR DETAILS:", str(e))
+        return f"⚠️ Error: {str(e)[:100]}"
 
     reply = completion.choices[0].message.content.strip()
-    reply = reply.replace("\\n", "\n").replace("**", "").replace("*", "")
+
+    reply = reply.replace("\\n", "\n")
+    reply = reply.replace("**", "").replace("*", "")
 
     conversation_memory.setdefault(user_id, [])
-    conversation_memory[user_id].extend([
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": reply}
-    ])
+
+    conversation_memory[user_id].append({
+        "role": "user",
+        "content": prompt
+    })
+
+    conversation_memory[user_id].append({
+        "role": "assistant",
+        "content": reply
+    })
 
     conversation_memory[user_id] = conversation_memory[user_id][-MAX_MEMORY_MESSAGES:]
-    save_memory(conversation_memory)
+
+    save_memory()
 
     return reply
 
+
 # ---------------- ROUTER ----------------
-def router(user_id: str, prompt: str, image: str | None = None) -> str:
+
+def router(user_id: str, prompt: str, image=None) -> str:
+
     p = prompt.lower()
+
     if p in ["reset", "clear memory"]:
         conversation_memory[user_id] = []
-        save_memory(conversation_memory)
+        save_memory()
         return "Memory cleared."
+
     if "time" in p or "date" in p:
         return datetime.datetime.now().strftime("%d %B %Y, %H:%M:%S")
+
     return call_ai(user_id, prompt, image)
 
+
+# ---------------- AUTH ROUTES ----------------
+
+@app.post("/register")
+def register(data: Register):
+
+    if data.username in users_db:
+        raise HTTPException(400, "User exists")
+
+    users_db[data.username] = {
+        "password": hash_pass(data.password),
+        "created": str(datetime.datetime.utcnow())
+    }
+
+    save_json(USERS_FILE, users_db)
+
+    return {"status": "registered"}
+
+
+@app.post("/login")
+def login(data: Login):
+
+    user = users_db.get(data.username)
+
+    if not user:
+        raise HTTPException(401, "Invalid login")
+
+    if not verify_pass(data.password, user["password"]):
+        raise HTTPException(401, "Invalid login")
+
+    token = create_token(data.username)
+
+    return {"token": token}
+
+
+@app.get("/me")
+def me(user=Depends(auth)):
+    return {"username": user}
+
+
 # ---------------- ROUTES ----------------
+
+@app.get("/test")
+def test():
+    return {"status": "working"}
+
+
 @app.get("/")
 def root():
     return {"status": "AI backend running"}
 
+
 @app.post("/chat")
-def chat(req: ChatRequest):
-    return {"reply": router(req.user_id, req.message, req.image)}
+def chat(req: ChatRequest, user=Depends(auth)):
+
+    reply = router(user, req.message, req.image)
+
+    return {"reply": reply}
+
 
 @app.post("/chat-stream")
-def chat_stream(req: ChatRequest):
+def chat_stream(req: ChatRequest, user=Depends(auth)):
+
     def stream():
+
         completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                *get_context_messages(req.user_id),
+                {"role": "system", "content": "Assistant"},
+                *get_context_messages(user),
                 {"role": "user", "content": req.message}
             ],
             stream=True
         )
+
         for chunk in completion:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content
+
     return StreamingResponse(stream(), media_type="text/plain")
 
-# ---------------- RUN (RENDER SAFE) ----------------
+
+# ---------------- RUN ----------------
+
 if __name__ == "__main__":
+
     import uvicorn
+
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
