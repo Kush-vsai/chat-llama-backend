@@ -325,7 +325,7 @@ def chat_stream(req: ChatRequest, user=Depends(auth)):
     def stream():
 
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": "Assistant"},
                 *get_context_messages(user),
