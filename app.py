@@ -161,17 +161,36 @@ def subject_prompt(subject: str) -> str:
 # ---------------- MEMORY - KEEP 23 MESSAGES ----------------
 
 def get_context_messages(user_id: str):
-    
+
     history = conversation_memory.get(user_id, [])
-    
-    # Keep last 23 messages (11-12 exchanges) - perfect balance for GROQ free tier
-    return [{"role": m["role"], "content": m["content"]}
-            for m in history[-23:]]
 
+    context = []
+    total_chars = 0
+    MAX_CHARS = 3500   # Safe for Groq free tier
 
-def save_memory():
-    save_json(MEMORY_FILE, conversation_memory)
+    # Take newest messages first (reverse)
+    for m in reversed(history):
 
+        text = m["content"]
+
+        if not text:
+            continue
+
+        length = len(text)
+
+        # Stop if context is getting too big
+        if total_chars + length > MAX_CHARS:
+            break
+
+        context.append({
+            "role": m["role"],
+            "content": text[:1200]  # Hard cap per message
+        })
+
+        total_chars += length
+
+    # Reverse back to normal order
+    return list(reversed(context))
 
 # ---------------- AI ----------------
 
@@ -189,7 +208,7 @@ def call_ai(user_id: str, prompt: str, image=None) -> str:
     try:
 
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.4
         )
